@@ -17,7 +17,7 @@ template <typename T, typename IdxT, typename LocT, int N>
   LocT src_idx = static_cast<LocT>(stride) * idx;
   LocT out_idx = static_cast<LocT>(stride) * index.y;
 
-  int s_idx = N * index.x;
+  LocT s_idx = static_cast<LocT>(N) * index.x;
   for (int i = 0; i < N && s_idx < stride; ++i, ++s_idx) {
     out[out_idx + s_idx] = src[src_idx + s_idx];
   }
