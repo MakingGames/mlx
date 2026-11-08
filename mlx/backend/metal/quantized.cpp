@@ -13,6 +13,7 @@
 #include "mlx/fast_primitives.h"
 #include "mlx/primitives.h"
 #include "mlx/utils.h"
+#include "mlx/utils.h"
 
 namespace mlx::core {
 
@@ -1860,8 +1861,13 @@ void dispatch_qmv(
   }
 
   // Small batch so route to qmv_wide, which reuses each weight group across the
-  // M vectors.
-  if (M >= 2 && use_qmv_wide(mode, d) && !global_scale) {
+  // M vectors. MLX_QMV_WIDE=0 keeps these rows on qmv instead: qmv and qmv_wide
+  // reduce in different orders, so a k-row speculative verify through qmv_wide
+  // rounds differently from k single-row decodes through qmv, and a model that
+  // amplifies rounding (Qwen3.8-Flash-Next) can emit a different token at T = 0
+  // with speculation on than off. Off by default; a Coder delta (ticket 238).
+  static const bool qmv_wide_enabled = env::get_var("MLX_QMV_WIDE", 1) != 0;
+  if (M >= 2 && qmv_wide_enabled && use_qmv_wide(mode, d) && !global_scale) {
     qmv_wide(x, w, scales, biases, out, group_size, bits, M, N, K, d, s, mode);
     return;
   }
