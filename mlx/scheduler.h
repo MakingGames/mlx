@@ -63,11 +63,22 @@ class MLX_API Scheduler {
     }
   }
 
+  // Coder delta (ticket 287): how many times an evaluation was held back
+  // because too many tasks were unfinished. A count for the commit stats.
+  void notify_held_back() {
+    n_held_back_++;
+  }
+
+  uint64_t n_held_back() const {
+    return n_held_back_;
+  }
+
  private:
   friend Stream mlx::core::new_stream(Device d);
 
   StreamThread& get_thread(Stream s);
 
+  std::atomic<uint64_t> n_held_back_{0};
   int n_active_tasks_{0};
   std::unordered_map<int, std::unique_ptr<StreamThread>> threads_;
   std::shared_mutex threads_mtx_;
@@ -112,6 +123,14 @@ inline void notify_task_completion(const Stream& stream) {
 
 inline void wait_for_one() {
   scheduler().wait_for_one();
+}
+
+inline void notify_held_back() {
+  scheduler().notify_held_back();
+}
+
+inline uint64_t n_held_back() {
+  return scheduler().n_held_back();
 }
 
 } // namespace mlx::core::scheduler

@@ -202,6 +202,21 @@ inline int max_mb_per_buffer(int default_value) {
   return max_mb_per_buffer_;
 }
 
+// Coder delta (ticket 287). With MLX_METAL_COMMIT_STATS=1 the Metal backend
+// prints, at each synchronize, how many command buffers each place has
+// committed and what they held.
+inline bool metal_commit_stats() {
+  static bool metal_commit_stats_ = get_var("MLX_METAL_COMMIT_STATS", 0) != 0;
+  return metal_commit_stats_;
+}
+
+// Coder delta (ticket 287). With MLX_METAL_EMPTY_COMMITS=1 a command buffer
+// that holds nothing is still committed, as upstream does. Read at each call,
+// so one process can be measured both ways.
+inline bool metal_empty_commits() {
+  return get_var("MLX_METAL_EMPTY_COMMITS", 0) != 0;
+}
+
 // Per-set residency-set size, as a percentage of the device's recommended
 // max working-set size. Controls only how wired memory is distributed across
 // residency sets, never how much is wired; see metal::ResidencySets. A value

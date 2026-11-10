@@ -1,5 +1,7 @@
 // Copyright © 2023-2024 Apple Inc.
 
+#include <atomic>
+#include <cstdio>
 #include <cstdlib>
 #include <sstream>
 
@@ -14,6 +16,7 @@
 #include "mlx/backend/metal/event.h"
 #include "mlx/backend/metal/metal.h"
 #include "mlx/backend/metal/utils.h"
+#include "mlx/scheduler.h"
 #include "mlx/utils.h"
 
 namespace std {
@@ -33,6 +36,32 @@ namespace mlx::core::metal {
 namespace {
 
 constexpr const char* default_mtllib_path = METAL_PATH;
+
+// Coder delta (ticket 287). Every commit, by the place it comes from (the
+// rows: eval, finalize, synchronize) and by what the buffer held (the columns:
+// a compute encoder; a signal or a wait and no encoder; only a handler that
+// keeps arrays alive; nothing). Summed over all streams. Printed by
+// print_commit_stats.
+std::atomic<uint64_t> commit_counts[3][4];
+std::atomic<uint64_t> commits_skipped{0};
+
+void print_commit_stats() {
+  static const char* sites[3] = {"eval", "finalize", "synchronize"};
+  std::string line = "[metal::commits]";
+  for (int site = 0; site < 3; site++) {
+    line += fmt::format(
+        " {}: work={} event={} keep={} empty={}{}",
+        sites[site],
+        commit_counts[site][0].load(),
+        commit_counts[site][1].load(),
+        commit_counts[site][2].load(),
+        commit_counts[site][3].load(),
+        site == 1 ? fmt::format(" skipped={}", commits_skipped.load()) : "");
+    line += " |";
+  }
+  line += fmt::format(" held_back={}\n", scheduler::n_held_back());
+  fputs(line.c_str(), stderr);
+}
 
 void set_compile_options(
     MTL::CompileOptions* mtl_options,
@@ -539,7 +568,29 @@ bool CommandEncoder::needs_commit() const {
   return (buffer_ops_ > max_ops) || ((buffer_sizes_ >> 20) > max_mb);
 }
 
-void CommandEncoder::commit(std::function<void()> completion) {
+bool CommandEncoder::skip_empty_commit() {
+  if (buffer_encoded_ || buffer_keeps_arrays_ || !signal_events_.empty() ||
+      !wait_events_.empty()) {
+    return false;
+  }
+  if (env::metal_empty_commits()) {
+    return false;
+  }
+  commits_skipped++;
+  return true;
+}
+
+void CommandEncoder::commit(
+    std::function<void()> completion,
+    CommitSite site) {
+  // Coder delta (ticket 287): count the commit by place and by what it holds.
+  int held = buffer_encoded_
+      ? 0
+      : (!signal_events_.empty() || !wait_events_.empty())
+          ? 1
+          : (buffer_keeps_arrays_ ? 2 : 3);
+  commit_counts[static_cast<int>(site)][held]++;
+
   // Metal locks a command buffer's residency at commit time, so attach any
   // sets created since the last commit first.
   residency_sets_.attach_new_sets(queue_.get(), sets_attached_);
@@ -585,14 +636,20 @@ void CommandEncoder::commit(std::function<void()> completion) {
   buffer_ = NS::RetainPtr(queue_->commandBufferWithUnretainedReferences());
   buffer_ops_ = 0;
   buffer_sizes_ = 0;
+  buffer_encoded_ = false;
+  buffer_keeps_arrays_ = false;
 }
 
 void CommandEncoder::synchronize() {
   auto pool = new_scoped_memory_pool();
   auto cbuf = buffer_; // retained
   end_encoding();
-  commit();
+  commit(nullptr, CommitSite::synchronize);
   cbuf->waitUntilCompleted();
+
+  if (env::metal_commit_stats()) {
+    print_commit_stats();
+  }
 
   if (!exiting_) {
     error_.check();
@@ -605,6 +662,7 @@ MTL::ComputeCommandEncoder* CommandEncoder::get_command_encoder() {
     encoder_ = NS::RetainPtr(
         buffer_->computeCommandEncoder(MTL::DispatchTypeConcurrent));
     fence_ = NS::TransferPtr(device_.mtl_device()->newFence());
+    buffer_encoded_ = true;
   }
   return encoder_.get();
 }

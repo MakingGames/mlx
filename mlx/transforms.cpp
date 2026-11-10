@@ -279,6 +279,7 @@ array eval_impl(std::vector<array> outputs, bool async) {
           (get_active_memory() > get_memory_limit() &&
            scheduler::n_active_tasks() > 0)) {
         // Commit any open streams
+        scheduler::notify_held_back();
         for (auto& s : open_streams) {
           if (s.device == Device::gpu) {
             gpu::finalize(s);
