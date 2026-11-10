@@ -65,22 +65,15 @@ void eval(array& arr) {
   } else {
     command_buffer->addCompletedHandler(
         [buffers = std::move(buffers)](MTL::CommandBuffer* cbuf) {});
-    encoder.note_completed_handler();
   }
 }
 
 void finalize(Stream s) {
   auto pool = metal::new_scoped_memory_pool();
   auto& encoder = metal::get_command_encoder(s);
-  // Coder delta (ticket 287): a buffer that has had no encoder, carries no
-  // signal or wait and keeps no arrays alive has nothing to run and nothing
-  // waiting on it. Committing it is a call into the kernel for no work, so it
-  // is left for the next commit.
-  if (encoder.skip_empty_commit()) {
-    return;
-  }
+  auto* cb = encoder.get_command_buffer();
   encoder.end_encoding();
-  encoder.commit(nullptr, metal::CommandEncoder::CommitSite::finalize);
+  encoder.commit();
 }
 
 void synchronize(Stream s) {

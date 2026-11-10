@@ -98,28 +98,8 @@ class MLX_API CommandEncoder {
   void wait_event(Event event, uint64_t value);
   void signal_event(Event event, uint64_t value);
   bool needs_commit() const;
-
-  // Coder delta (ticket 287): the place a commit comes from, for the counts
-  // MLX_METAL_COMMIT_STATS prints.
-  enum class CommitSite { eval = 0, finalize = 1, synchronize = 2 };
-  void commit(
-      std::function<void()> completion = nullptr,
-      CommitSite site = CommitSite::eval);
+  void commit(std::function<void()> completion = nullptr);
   void synchronize();
-
-  // Coder delta (ticket 287): true when the current command buffer has had no
-  // encoder, carries no signal or wait and keeps no arrays alive, and such
-  // buffers are not to be committed (MLX_METAL_EMPTY_COMMITS unset). Nothing
-  // can be waiting on such a buffer, so the caller leaves it for the next
-  // commit. Counts the skip.
-  bool skip_empty_commit();
-
-  // Coder delta (ticket 287): the caller has attached a completion handler
-  // that keeps arrays alive until the current command buffer completes, so
-  // the buffer is committed even when it has no encoder.
-  void note_completed_handler() {
-    buffer_keeps_arrays_ = true;
-  }
 
   MTL::CommandBuffer* get_command_buffer() const {
     return buffer_.get();
@@ -136,10 +116,6 @@ class MLX_API CommandEncoder {
   NS::SharedPtr<MTL::CommandBuffer> buffer_;
   int buffer_ops_{0};
   size_t buffer_sizes_{0};
-  // Whether the current command buffer has had a compute encoder, and whether
-  // a completion handler on it keeps arrays alive (ticket 287).
-  bool buffer_encoded_{false};
-  bool buffer_keeps_arrays_{false};
 
   // The residency set and how many of its sets this queue has attached.
   ResidencySets& residency_sets_;
