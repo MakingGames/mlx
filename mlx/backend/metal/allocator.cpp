@@ -4,10 +4,12 @@
 #include "mlx/backend/metal/metal.h"
 #include "mlx/backend/metal/resident.h"
 #include "mlx/memory.h"
+#include "mlx/utils.h"
 
 #include <mach/vm_page_size.h>
 #include <unistd.h>
 #include <cassert>
+#include <cstdio>
 #include <cstdlib>
 
 namespace mlx::core {
@@ -42,6 +44,38 @@ bool can_reuse_alien_buffer(void* ptr) {
 
 namespace metal {
 
+namespace {
+
+// The collection limit: once the memory in use plus the cached buffers would
+// pass it, a cache miss releases cached buffers. By default it is 95% of the
+// recommended working set, capped by the memory limit.
+//
+// MLX_GC_LIMIT_MB (MiB, unset or 0 for the default) replaces the 95% term; the
+// memory limit still caps it. A model whose weights alone come to about the
+// default has no room left for the cache: every miss then empties it and each
+// following operation makes a new buffer in the kernel. A host that knows how
+// much the machine can keep wired can give the cache that room. It is read
+// each time the limit is computed, not once, so a host can set it and then
+// call set_memory_limit.
+size_t collection_limit(size_t block_limit, size_t max_rec_size) {
+  size_t limit =
+      std::min(static_cast<size_t>(0.95 * max_rec_size), block_limit);
+  if (int mb = env::get_var("MLX_GC_LIMIT_MB", 0); mb > 0) {
+    size_t asked = std::min(static_cast<size_t>(mb) << 20, block_limit);
+    fprintf(
+        stderr,
+        "[metal::allocator] collection limit %zu MiB (MLX_GC_LIMIT_MB=%d), "
+        "default %zu MiB\n",
+        asked >> 20,
+        mb,
+        limit >> 20);
+    limit = asked;
+  }
+  return limit;
+}
+
+} // namespace
+
 MetalAllocator::MetalAllocator(Device& d)
     : device_(d.mtl_device()),
       residency_sets_(d.residency_sets()),
@@ -61,7 +95,7 @@ MetalAllocator::MetalAllocator(Device& d)
       std::get<size_t>(info.at("max_recommended_working_set_size"));
   resource_limit_ = std::get<size_t>(info.at("resource_limit"));
   block_limit_ = std::min(1.5 * max_rec_size, 0.95 * memsize);
-  gc_limit_ = std::min(static_cast<size_t>(0.95 * max_rec_size), block_limit_);
+  gc_limit_ = collection_limit(block_limit_, max_rec_size);
   max_pool_size_ = block_limit_;
   bool is_vm = std::get<std::string>(info.at("device_name")) ==
       "Apple Paravirtual device";
@@ -87,9 +121,8 @@ size_t MetalAllocator::set_cache_limit(size_t limit) {
 size_t MetalAllocator::set_memory_limit(size_t limit) {
   std::unique_lock lk(mutex_);
   std::swap(limit, block_limit_);
-  gc_limit_ = std::min(
-      block_limit_,
-      static_cast<size_t>(0.95 * device_->recommendedMaxWorkingSetSize()));
+  gc_limit_ =
+      collection_limit(block_limit_, device_->recommendedMaxWorkingSetSize());
   return limit;
 };
 
