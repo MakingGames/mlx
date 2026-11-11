@@ -1914,8 +1914,10 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
   // It is a matrix matrix product.
   if (M >= vector_limit) {
     // Use split-K qmm for small M with transposed weights (non-batched only)
+    // MLX_QMM_SPLITK_MAX_ROWS=n keeps a product of more than n rows on qmm.
     int B = out.size() / M / N;
-    if (transpose_ && B == 1) {
+    int splitk_max_rows = env::get_var("MLX_QMM_SPLITK_MAX_ROWS", -1);
+    if (transpose_ && B == 1 && (splitk_max_rows < 0 || M <= splitk_max_rows)) {
       qmm_splitk(
           x, w, scales, biases, out, group_size_, bits_, M, N, K, d, s, mode);
       return;
