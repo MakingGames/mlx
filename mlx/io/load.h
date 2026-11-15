@@ -64,7 +64,16 @@ class ParallelFileReader : public Reader {
  public:
   explicit ParallelFileReader(std::string file_path)
       : fd_(open(file_path.c_str(), O_RDONLY | O_BINARY)),
-        label_(std::move(file_path)) {}
+        label_(std::move(file_path)) {
+#ifdef __APPLE__
+    // Coder experiment (ticket 280), not for a release: ask macOS not to keep
+    // what this reader reads in its file cache. A load reads every byte of a
+    // model once, into memory MLX keeps, so a cached copy is a second copy.
+    if (fd_ > 0) {
+      fcntl(fd_, F_NOCACHE, 1);
+    }
+#endif
+  }
 
   ~ParallelFileReader() override {
     close(fd_);
