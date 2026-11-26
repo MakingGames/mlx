@@ -1,5 +1,7 @@
 // Copyright © 2023-2024 Apple Inc.
 
+#include <atomic>
+#include <cstdio>
 #include <cstdlib>
 #include <sstream>
 
@@ -33,6 +35,36 @@ namespace mlx::core::metal {
 namespace {
 
 constexpr const char* default_mtllib_path = METAL_PATH;
+
+// Coder delta 6 (ticket 335). Counted only under MLX_METAL_COMMIT_STATS,
+// summed over all streams, printed once at exit.
+std::atomic<uint64_t> stat_dispatches{0};
+std::atomic<uint64_t> stat_encoders{0};
+std::atomic<uint64_t> stat_buffers{0};
+std::atomic<uint64_t> stat_handlers{0};
+
+void print_commit_stats() {
+  fprintf(
+      stderr,
+      "[metal::stats] dispatches=%llu encoders=%llu command_buffers=%llu "
+      "completion_handlers=%llu\n",
+      (unsigned long long)stat_dispatches.load(),
+      (unsigned long long)stat_encoders.load(),
+      (unsigned long long)stat_buffers.load(),
+      (unsigned long long)stat_handlers.load());
+}
+
+// True when the counts are on; the first call registers the print at exit.
+inline bool commit_stats() {
+  static bool on = []() {
+    bool v = env::metal_commit_stats();
+    if (v) {
+      std::atexit(print_commit_stats);
+    }
+    return v;
+  }();
+  return on;
+}
 
 void set_compile_options(
     MTL::CompileOptions* mtl_options,
@@ -426,6 +458,9 @@ void CommandEncoder::dispatch_threadgroups(
     MTL::Size group_dims) {
   maybeInsertBarrier();
   buffer_ops_++;
+  if (commit_stats()) {
+    stat_dispatches++;
+  }
   get_command_encoder()->dispatchThreadgroups(grid_dims, group_dims);
 }
 
@@ -434,6 +469,9 @@ void CommandEncoder::dispatch_threads(
     MTL::Size group_dims) {
   maybeInsertBarrier();
   buffer_ops_++;
+  if (commit_stats()) {
+    stat_dispatches++;
+  }
   get_command_encoder()->dispatchThreads(grid_dims, group_dims);
 }
 
@@ -494,6 +532,9 @@ void CommandEncoder::end_encoding(bool wait_in_flight) {
   }
 
   encoder_->updateFence(fence_.get());
+  if (commit_stats()) {
+    stat_handlers++;
+  }
   buffer_->addCompletedHandler([this,
                                 fence = std::move(fence_),
                                 temporaries = std::move(temporaries_),
@@ -543,8 +584,15 @@ void CommandEncoder::commit(std::function<void()> completion) {
   // Metal locks a command buffer's residency at commit time, so attach any
   // sets created since the last commit first.
   residency_sets_.attach_new_sets(queue_.get(), sets_attached_);
+  if (commit_stats()) {
+    stat_buffers++;
+    stat_handlers++;
+  }
+  // Coder delta 6 (ticket 335): `held` is the data gpu::eval asked to keep
+  // alive until this buffer completes. It is released with the handler.
   buffer_->addCompletedHandler(
       [&error_ = error_,
+       held = std::move(held_),
        wait_events = std::move(wait_events_),
        signal_events = std::move(signal_events_),
        completion = std::move(completion)](MTL::CommandBuffer* cbuf) mutable {
@@ -585,6 +633,7 @@ void CommandEncoder::commit(std::function<void()> completion) {
   buffer_ = NS::RetainPtr(queue_->commandBufferWithUnretainedReferences());
   buffer_ops_ = 0;
   buffer_sizes_ = 0;
+  held_.clear();
 }
 
 void CommandEncoder::synchronize() {
@@ -605,8 +654,17 @@ MTL::ComputeCommandEncoder* CommandEncoder::get_command_encoder() {
     encoder_ = NS::RetainPtr(
         buffer_->computeCommandEncoder(MTL::DispatchTypeConcurrent));
     fence_ = NS::TransferPtr(device_.mtl_device()->newFence());
+    if (commit_stats()) {
+      stat_encoders++;
+    }
   }
   return encoder_.get();
+}
+
+void count_completion_handler() {
+  if (commit_stats()) {
+    stat_handlers++;
+  }
 }
 
 Device::Device() : device_(load_device()), residency_sets_(device_.get()) {

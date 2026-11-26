@@ -105,6 +105,13 @@ class MLX_API CommandEncoder {
     return buffer_.get();
   }
 
+  // Coder delta 6 (ticket 335). Keep an array's data alive until the current
+  // command buffer has completed. The list is handed to the one completion
+  // handler commit() adds, in place of a handler for every operation.
+  void hold(std::shared_ptr<array::Data> data) {
+    held_.push_back(std::move(data));
+  }
+
  private:
   MTL::ComputeCommandEncoder* get_command_encoder();
 
@@ -116,6 +123,9 @@ class MLX_API CommandEncoder {
   NS::SharedPtr<MTL::CommandBuffer> buffer_;
   int buffer_ops_{0};
   size_t buffer_sizes_{0};
+
+  // Coder delta 6 (ticket 335): data kept alive until buffer_ completes.
+  std::vector<std::shared_ptr<array::Data>> held_;
 
   // The residency set and how many of its sets this queue has attached.
   ResidencySets& residency_sets_;
@@ -148,6 +158,10 @@ class MLX_API CommandEncoder {
   std::unordered_map<const void*, NS::SharedPtr<MTL::Fence>> prev_ce_outputs_;
   std::mutex outputs_mtx_;
 };
+
+// Coder delta 6 (ticket 335): one more completion handler, for the counts
+// MLX_METAL_COMMIT_STATS prints. For the handler gpu::eval adds itself.
+MLX_API void count_completion_handler();
 
 class MLX_API Device {
  public:

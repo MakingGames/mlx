@@ -1069,6 +1069,47 @@ MTL::ComputePipelineState* get_quantized_kernel(
   return d.get_kernel(kernel_name, lib);
 }
 
+// Coder delta 6 (ticket 335): the template text is built on a miss only.
+MTL::ComputePipelineState* get_quantized_kernel(
+    metal::Device& d,
+    const std::string& kernel_name,
+    const LazyTemplateDef& template_def,
+    const std::string& mode) {
+  const auto& lib_name = kernel_name;
+  auto lib = d.get_library(lib_name, [&]() {
+    std::string kernel_source;
+    concatenate(
+        kernel_source,
+        metal::utils(),
+        metal::gemm(),
+        metal::quantized_utils(),
+        (mode == "affine") ? metal::quantized() : metal::fp_quantized(),
+        template_def());
+    return kernel_source;
+  });
+  return d.get_kernel(kernel_name, lib);
+}
+
+MTL::ComputePipelineState* get_qmm_nax_kernel(
+    metal::Device& d,
+    const std::string& kernel_name,
+    const LazyTemplateDef& template_def,
+    const std::string& mode) {
+  const auto& lib_name = kernel_name;
+  auto lib = d.get_library(lib_name, [&]() {
+    std::string kernel_source;
+    concatenate(
+        kernel_source,
+        metal::utils(),
+        metal::gemm_nax(),
+        metal::quantized_utils(),
+        (mode == "affine") ? metal::quantized_nax() : metal::fp_quantized_nax(),
+        template_def());
+    return kernel_source;
+  });
+  return d.get_kernel(kernel_name, lib);
+}
+
 MTL::ComputePipelineState* get_gather_qmm_kernel(
     metal::Device& d,
     const std::string& kernel_name,

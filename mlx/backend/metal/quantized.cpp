@@ -29,11 +29,21 @@ auto get_quantized_kernel_wrapped(
     int group_size,
     int bits,
     Args... args) {
-  std::string template_def;
-  std::string fname = ((mode == "affine") ? "affine_" : "fp_") + func;
-  template_def = get_template_definition(
-      name, fname, type, group_size, bits, std::forward<Args>(args)...);
-  return get_quantized_kernel(d, name, template_def, mode);
+  // Coder delta 6 (ticket 335). The template text is used only to compile the
+  // kernel's library, once. Upstream formats it on every dispatch; here it is
+  // built when the lookup misses. MLX_QMV_EAGER_TEMPLATE=1 restores upstream.
+  auto build = [&]() {
+    std::string fname = ((mode == "affine") ? "affine_" : "fp_") + func;
+    return get_template_definition(name, fname, type, group_size, bits, args...);
+  };
+  if (env::qmv_eager_template()) {
+    std::string template_def = build();
+    return get_quantized_kernel(d, name, template_def, mode);
+  }
+  using Build = decltype(build);
+  LazyTemplateDef lazy{
+      [](void* context) { return (*static_cast<Build*>(context))(); }, &build};
+  return get_quantized_kernel(d, name, lazy, mode);
 }
 
 template <typename... Args>
@@ -46,11 +56,21 @@ auto get_qmm_nax_kernel_wrapped(
     int group_size,
     int bits,
     Args... args) {
-  std::string template_def;
-  std::string fname = ((mode == "affine") ? "affine_" : "fp_") + func;
-  template_def = get_template_definition(
-      name, fname, type, group_size, bits, std::forward<Args>(args)...);
-  return get_qmm_nax_kernel(d, name, template_def, mode);
+  // Coder delta 6 (ticket 335). The template text is used only to compile the
+  // kernel's library, once. Upstream formats it on every dispatch; here it is
+  // built when the lookup misses. MLX_QMV_EAGER_TEMPLATE=1 restores upstream.
+  auto build = [&]() {
+    std::string fname = ((mode == "affine") ? "affine_" : "fp_") + func;
+    return get_template_definition(name, fname, type, group_size, bits, args...);
+  };
+  if (env::qmv_eager_template()) {
+    std::string template_def = build();
+    return get_qmm_nax_kernel(d, name, template_def, mode);
+  }
+  using Build = decltype(build);
+  LazyTemplateDef lazy{
+      [](void* context) { return (*static_cast<Build*>(context))(); }, &build};
+  return get_qmm_nax_kernel(d, name, lazy, mode);
 }
 
 inline array

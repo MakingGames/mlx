@@ -375,6 +375,23 @@ MTL::ComputePipelineState* get_quantized_kernel(
   return d.get_kernel(kernel_name);
 }
 
+// Coder delta 6 (ticket 335): the overloads that take the text unbuilt.
+MTL::ComputePipelineState* get_quantized_kernel(
+    metal::Device& d,
+    const std::string& kernel_name,
+    const LazyTemplateDef&,
+    const std::string&) {
+  return d.get_kernel(kernel_name);
+}
+
+MTL::ComputePipelineState* get_qmm_nax_kernel(
+    metal::Device& d,
+    const std::string& kernel_name,
+    const LazyTemplateDef&,
+    const std::string&) {
+  return d.get_kernel(kernel_name);
+}
+
 MTL::ComputePipelineState* get_gather_qmm_kernel(
     metal::Device& d,
     const std::string& kernel_name,

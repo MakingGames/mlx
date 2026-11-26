@@ -312,6 +312,29 @@ MTL::ComputePipelineState* get_quantized_kernel(
     const std::string& template_def,
     const std::string& mode);
 
+// Coder delta 6 (ticket 335). A kernel's template text, built when asked for.
+// The lookups below call it only when the kernel's library is not compiled
+// yet, so a dispatch of a kernel already built formats no text.
+struct LazyTemplateDef {
+  std::string (*build)(void* context);
+  void* context;
+  std::string operator()() const {
+    return build(context);
+  }
+};
+
+MTL::ComputePipelineState* get_quantized_kernel(
+    metal::Device& d,
+    const std::string& kernel_name,
+    const LazyTemplateDef& template_def,
+    const std::string& mode);
+
+MTL::ComputePipelineState* get_qmm_nax_kernel(
+    metal::Device& d,
+    const std::string& kernel_name,
+    const LazyTemplateDef& template_def,
+    const std::string& mode);
+
 MTL::ComputePipelineState* get_gather_qmm_kernel(
     metal::Device& d,
     const std::string& kernel_name,

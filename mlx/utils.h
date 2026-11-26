@@ -232,6 +232,29 @@ inline int nccl_timeout(int default_value) {
   return nccl_timeout;
 }
 
+// Coder delta 6 (ticket 335). At 1, gpu::eval adds a completion handler for
+// every operation, as upstream does. By default the buffers an operation must
+// keep alive ride on the one handler its command buffer gets at commit.
+inline bool metal_handler_per_op() {
+  static bool metal_handler_per_op_ = get_var("MLX_METAL_HANDLER_PER_OP", 0);
+  return metal_handler_per_op_;
+}
+
+// Coder delta 6 (ticket 335). At 1, a quantized kernel's template text is
+// built on every dispatch, as upstream does. By default it is built only when
+// the kernel's library is not yet compiled, the one time it is used.
+inline bool qmv_eager_template() {
+  static bool qmv_eager_template_ = get_var("MLX_QMV_EAGER_TEMPLATE", 0);
+  return qmv_eager_template_;
+}
+
+// Coder delta 6 (ticket 335). At 1, counts dispatches, compute encoders,
+// command buffers and completion handlers, and prints them at exit.
+inline bool metal_commit_stats() {
+  static bool metal_commit_stats_ = get_var("MLX_METAL_COMMIT_STATS", 0);
+  return metal_commit_stats_;
+}
+
 inline const std::string& metal_gpu_arch() {
   static std::string gpu_arch_ = get_var("MLX_METAL_GPU_ARCH", "");
   return gpu_arch_;

@@ -44,6 +44,33 @@ void eval(array& arr) {
     debug_set_primitive_buffer_label(command_buffer, arr.primitive());
     arr.primitive().eval_gpu(arr.inputs(), outputs);
   }
+  // Coder delta 6 (ticket 335). The data of the inputs and the siblings must
+  // outlive the command buffer that reads and writes it. Upstream gives every
+  // operation a completion handler that owns a set of them. Here they join
+  // the encoder's list, which the one handler commit() adds takes with it. A
+  // buffer is held until the same event: its command buffer's completion.
+  // MLX_METAL_HANDLER_PER_OP=1 restores upstream's handler an operation.
+  if (!env::metal_handler_per_op()) {
+    const auto& own = arr.data_shared_ptr();
+    for (auto& in : arr.inputs()) {
+      // Not the output, if an input donated its buffer to it.
+      if (in.data_shared_ptr() != own) {
+        encoder.hold(in.data_shared_ptr());
+      }
+    }
+    for (auto& sib : arr.siblings()) {
+      if (sib.data_shared_ptr() != own) {
+        encoder.hold(sib.data_shared_ptr());
+      }
+    }
+    if (encoder.needs_commit()) {
+      encoder.end_encoding();
+      scheduler::notify_new_task(s);
+      encoder.commit([s]() { scheduler::notify_task_completion(s); });
+    }
+    return;
+  }
+
   std::unordered_set<std::shared_ptr<array::Data>> buffers;
   for (auto& in : arr.inputs()) {
     buffers.insert(in.data_shared_ptr());
@@ -63,6 +90,7 @@ void eval(array& arr) {
       scheduler::notify_task_completion(s);
     });
   } else {
+    metal::count_completion_handler();
     command_buffer->addCompletedHandler(
         [buffers = std::move(buffers)](MTL::CommandBuffer* cbuf) {});
   }
