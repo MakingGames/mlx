@@ -145,6 +145,29 @@
   instantiate_quantized_wide_wrap(affine_qmv_wide, type, group_size, bits, 4, 8) \
   instantiate_quantized_wide_wrap(affine_qmv_wide, type, group_size, bits, 5, 8)
 
+// qmv_fast for 2 to 4 rows a threadgroup (Coder delta, ticket 336).
+#define instantiate_quantized_rows(type, group_size, bits, vecs, batched, partial_rows) \
+  instantiate_kernel(                                                    \
+      "affine_qmv_fast_rows_" #type "_gs_" #group_size "_b_" #bits "_nv_" #vecs "_batch_" #batched "_pr_" #partial_rows, \
+      affine_qmv_fast_rows,                                              \
+      type,                                                              \
+      group_size,                                                        \
+      bits,                                                              \
+      vecs,                                                              \
+      batched,                                                           \
+      partial_rows)
+
+#define instantiate_quantized_rows_wrap(type, group_size, bits, vecs) \
+  instantiate_quantized_rows(type, group_size, bits, vecs, 0, 0)      \
+  instantiate_quantized_rows(type, group_size, bits, vecs, 0, 1)      \
+  instantiate_quantized_rows(type, group_size, bits, vecs, 1, 0)      \
+  instantiate_quantized_rows(type, group_size, bits, vecs, 1, 1)
+
+#define instantiate_quantized_all_rows(type, group_size, bits) \
+  instantiate_quantized_rows_wrap(type, group_size, bits, 2)   \
+  instantiate_quantized_rows_wrap(type, group_size, bits, 3)   \
+  instantiate_quantized_rows_wrap(type, group_size, bits, 4)
+
 #define instantiate_quantized_all_splitk(type, group_size, bits)   \
   instantiate_quantized_split_k(affine_qvm_split_k, type, group_size, bits, 8)   \
   instantiate_quantized_split_k(affine_qvm_split_k, type, group_size, bits, 32)  \
@@ -172,6 +195,7 @@
   instantiate_quantized_all_aligned(type, group_size, bits) \
   instantiate_quantized_all_quad(type, group_size, bits)    \
   instantiate_quantized_all_wide(type, group_size, bits)    \
+  instantiate_quantized_all_rows(type, group_size, bits)    \
   instantiate_quantized_all_splitk(type, group_size, bits)  \
   instantiate_quantized_all_splitk_qmm(type, group_size, bits) \
   instantiate_quantized_all_rhs(type, group_size, bits)

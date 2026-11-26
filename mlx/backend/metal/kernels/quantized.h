@@ -961,6 +961,149 @@ METAL_FUNC void qmv_fast_impl(
   }
 }
 
+// qmv_fast for several rows of x in one threadgroup (Coder delta, ticket 336).
+// Every row's arithmetic is qmv_fast's, unchanged: the same lanes, the same
+// blocks, the same load_vector and qdot, the same simd_sum. So row v of an
+// M-row product has the bits qmv_fast gives that row alone, and a k-row
+// speculative verify rounds as k single-row decodes do. What changes is that
+// one threadgroup serves up to `vecs` rows, so a tile of weights is loaded by
+// one threadgroup instead of by one a row.
+template <
+    typename T,
+    int group_size,
+    int bits,
+    int vecs,
+    bool partial_rows = false>
+METAL_FUNC void qmv_fast_rows_impl(
+    const device uint32_t* w,
+    const device T* scales,
+    const device T* biases,
+    const device T* x,
+    device T* y,
+    const constant int& in_vec_size,
+    const constant int& out_vec_size,
+    const constant int& M,
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  constexpr int packs_per_thread = bits <= 2 ? 1 : 2;
+  constexpr int num_simdgroups = 2;
+  constexpr int results_per_simdgroup = 4;
+  constexpr int pack_factor = get_pack_factor<bits, 32>();
+  constexpr int bytes_per_pack = get_bytes_per_pack<bits, 32>();
+  constexpr int values_per_thread = pack_factor * packs_per_thread;
+  constexpr int block_size = values_per_thread * SIMD_SIZE;
+  constexpr int scale_step_per_thread = group_size / values_per_thread;
+
+  const device uint8_t* ws = (const device uint8_t*)w;
+
+  typedef float U;
+
+  thread U x_thread[vecs][values_per_thread];
+  thread U sums[vecs];
+  thread U result[vecs][results_per_simdgroup];
+  for (int v = 0; v < vecs; v++) {
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      result[v][row] = 0;
+    }
+  }
+
+  // The rows of x this threadgroup serves; the last tile may hold fewer.
+  const int first_vec = tid.x * vecs;
+  const int n_vecs = min(vecs, M - first_vec);
+
+  // Adjust positions
+  const int in_vec_size_w = in_vec_size * bytes_per_pack / pack_factor;
+  const int in_vec_size_g = in_vec_size / group_size;
+  const int out_row = tid.y * (num_simdgroups * results_per_simdgroup) +
+      simd_gid * results_per_simdgroup;
+
+  int last_row = results_per_simdgroup - 1;
+  if constexpr (partial_rows) {
+    if (out_row >= out_vec_size) {
+      return;
+    }
+    last_row = min(last_row, out_vec_size - 1 - out_row);
+  }
+
+  ws += out_row * in_vec_size_w + simd_lid * packs_per_thread * bytes_per_pack;
+  scales += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+  biases += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+  x += first_vec * in_vec_size + simd_lid * values_per_thread;
+  y += first_vec * out_vec_size + out_row;
+
+  const int aligned_end = (in_vec_size / block_size) * block_size;
+
+  for (int k = 0; k < aligned_end; k += block_size) {
+    for (int v = 0; v < n_vecs; v++) {
+      sums[v] = load_vector<T, U, values_per_thread, bits>(
+          x + v * in_vec_size, x_thread[v]);
+    }
+
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      int src = row;
+      if constexpr (partial_rows) {
+        src = min(row, last_row);
+      }
+      auto wl = (const device uint8_t*)(ws + src * in_vec_size_w);
+      const device T* sl = scales + src * in_vec_size_g;
+      const device T* bl = biases + src * in_vec_size_g;
+
+      U s = sl[0];
+      U b = bl[0];
+      for (int v = 0; v < n_vecs; v++) {
+        result[v][row] +=
+            qdot<U, values_per_thread, bits>(wl, x_thread[v], s, b, sums[v]);
+      }
+    }
+
+    ws += block_size * bytes_per_pack / pack_factor;
+    scales += block_size / group_size;
+    biases += block_size / group_size;
+    x += block_size;
+  }
+
+  // Tail block, as in qmv_fast: only 1-bit has a block larger than the
+  // dispatch gate's alignment.
+  if (aligned_end < in_vec_size) {
+    bool in_bounds =
+        (aligned_end + static_cast<int>(simd_lid) * values_per_thread) <
+        in_vec_size;
+    if (in_bounds) {
+      for (int v = 0; v < n_vecs; v++) {
+        sums[v] = load_vector<T, U, values_per_thread, bits>(
+            x + v * in_vec_size, x_thread[v]);
+      }
+
+      for (int row = 0; row < results_per_simdgroup; row++) {
+        int src = row;
+        if constexpr (partial_rows) {
+          src = min(row, last_row);
+        }
+        auto wl = (const device uint8_t*)(ws + src * in_vec_size_w);
+        const device T* sl = scales + src * in_vec_size_g;
+        const device T* bl = biases + src * in_vec_size_g;
+
+        U s = sl[0];
+        U b = bl[0];
+        for (int v = 0; v < n_vecs; v++) {
+          result[v][row] +=
+              qdot<U, values_per_thread, bits>(wl, x_thread[v], s, b, sums[v]);
+        }
+      }
+    }
+  }
+
+  for (int v = 0; v < n_vecs; v++) {
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      result[v][row] = simd_sum(result[v][row]);
+      if (simd_lid == 0 && row <= last_row) {
+        y[v * out_vec_size + row] = static_cast<T>(result[v][row]);
+      }
+    }
+  }
+}
+
 template <typename T, int group_size, int bits>
 METAL_FUNC void qmv_impl(
     const device uint32_t* w,
@@ -1793,6 +1936,65 @@ template <
       y,
       in_vec_size,
       out_vec_size,
+      tid,
+      simd_gid,
+      simd_lid);
+}
+
+template <
+    typename T,
+    int group_size,
+    int bits,
+    int vecs,
+    bool batched,
+    bool partial_rows = false>
+[[kernel]] void affine_qmv_fast_rows(
+    const device uint32_t* w [[buffer(0)]],
+    const device T* scales [[buffer(1)]],
+    const device T* biases [[buffer(2)]],
+    const device T* x [[buffer(3)]],
+    device T* y [[buffer(4)]],
+    const constant int& in_vec_size [[buffer(5)]],
+    const constant int& out_vec_size [[buffer(6)]],
+    const constant int& M [[buffer(7)]],
+    const constant int& x_batch_ndims [[buffer(8)]],
+    const constant int* x_shape [[buffer(9)]],
+    const constant int64_t* x_strides [[buffer(10)]],
+    const constant int& w_batch_ndims [[buffer(11)]],
+    const constant int* w_shape [[buffer(12)]],
+    const constant int64_t* w_strides [[buffer(13)]],
+    const constant int64_t* s_strides [[buffer(14)]],
+    const constant int64_t* b_strides [[buffer(15)]],
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  if (batched) {
+    adjust_matrix_offsets<T>(
+        x,
+        w,
+        scales,
+        biases,
+        y,
+        out_vec_size * M,
+        x_batch_ndims,
+        x_shape,
+        x_strides,
+        w_batch_ndims,
+        w_shape,
+        w_strides,
+        s_strides,
+        b_strides,
+        tid);
+  }
+  qmv_fast_rows_impl<T, group_size, bits, vecs, partial_rows>(
+      w,
+      scales,
+      biases,
+      x,
+      y,
+      in_vec_size,
+      out_vec_size,
+      M,
       tid,
       simd_gid,
       simd_lid);

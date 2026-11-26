@@ -543,6 +543,82 @@ void qmv(
   compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
 }
 
+// Dispatches affine_qmv_fast_rows: qmv_fast's arithmetic for every row, with up
+// to four rows of x served by one threadgroup, so a tile of weights is loaded
+// once for them and not once a row. Row v of the result has the bits qmv_fast
+// gives that row alone. A Coder delta (ticket 336).
+void qmv_fast_rows(
+    const array& x,
+    const array& w,
+    const array& scales,
+    const array& biases,
+    array& out,
+    int group_size,
+    int bits,
+    int M,
+    int N,
+    int K,
+    metal::Device& d,
+    const Stream& s) {
+  int B = out.size() / M / N;
+  bool batched = B > 1;
+
+  constexpr int bn = 8;
+  constexpr int bk = 32;
+
+  // The fewest tiles, then the smallest tile that fills them; a tile holds at
+  // most four rows.
+  int n_tiles = (M + 3) / 4;
+  int vecs = (M + n_tiles - 1) / n_tiles;
+  bool partial_rows = (N % bn != 0);
+
+  MTL::Size group_dims(bk, 2, 1);
+  MTL::Size grid_dims((M + vecs - 1) / vecs, (N + bn - 1) / bn, B);
+
+  std::string kname;
+  kname.reserve(64);
+  std::string type_string = get_type_string(x.dtype());
+  concatenate(
+      kname,
+      "affine_qmv_fast_rows_",
+      type_string,
+      "_gs_",
+      group_size,
+      "_b_",
+      bits,
+      "_nv_",
+      vecs,
+      batched ? "_batch_1" : "_batch_0",
+      partial_rows ? "_pr_1" : "_pr_0");
+  auto kernel = get_quantized_kernel_wrapped(
+      d,
+      kname,
+      "qmv_fast_rows",
+      "affine",
+      type_string,
+      group_size,
+      bits,
+      vecs,
+      batched,
+      partial_rows);
+
+  auto& compute_encoder = metal::get_command_encoder(s);
+  compute_encoder.set_compute_pipeline_state(kernel);
+
+  int c = 0;
+  compute_encoder.set_input_array(w, c++);
+  compute_encoder.set_input_array(scales, c++);
+  compute_encoder.set_input_array(biases, c++);
+  compute_encoder.set_input_array(x, c++);
+  compute_encoder.set_output_array(out, c++);
+  compute_encoder.set_bytes(K, c++);
+  compute_encoder.set_bytes(N, c++);
+  compute_encoder.set_bytes(M, c++);
+  add_strides_and_shapes(compute_encoder, !batched, x, w, scales, biases, c);
+
+  compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
+}
+
 // affine qmv_wide only beats qmv on gen-15+; fp benefits on every gen.
 inline bool use_qmv_wide(const std::string& mode, metal::Device& d) {
   return mode != "affine" || d.get_architecture_gen() >= 15;
@@ -1869,6 +1945,20 @@ void dispatch_qmv(
   static const bool qmv_wide_enabled = env::get_var("MLX_QMV_WIDE", 1) != 0;
   if (M >= 2 && qmv_wide_enabled && use_qmv_wide(mode, d) && !global_scale) {
     qmv_wide(x, w, scales, biases, out, group_size, bits, M, N, K, d, s, mode);
+    return;
+  }
+
+  // Rows kept off qmv_wide go to qmv_fast one threadgroup a row, and each
+  // loads the same weights again. MLX_QMV_ROWS=1 sends them to qmv_fast_rows
+  // instead: the same arithmetic and the same bits for every row, the weights
+  // loaded by one threadgroup for up to four rows. Only where qmv would have
+  // chosen qmv_fast (K a multiple of its block), affine, no global scale. Off
+  // by default; a Coder delta (ticket 336).
+  static const bool qmv_rows_enabled = env::get_var("MLX_QMV_ROWS", 0) != 0;
+  if (M >= 2 && qmv_rows_enabled && mode == "affine" && biases &&
+      !global_scale && K % qmv_fast_k_alignment(bits) == 0) {
+    qmv_fast_rows(
+        x, w, scales, *biases, out, group_size, bits, M, N, K, d, s);
     return;
   }
   qmv(x,
