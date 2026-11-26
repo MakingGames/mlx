@@ -1954,12 +1954,19 @@ void dispatch_qmv(
   // instead: the same arithmetic and the same bits for every row, the weights
   // loaded by one threadgroup for up to four rows. Only where qmv would have
   // chosen qmv_fast (K a multiple of its block), affine, no global scale. Off
-  // by default; a Coder delta (ticket 336). Its value is the most rows a
-  // threadgroup takes, 2 to 4; 1 means the default.
+  // by default; a Coder delta (ticket 336). At 1 the tile is chosen by the
+  // bit width and the rows; 2 to 4 sets the most rows a threadgroup takes.
   static const int qmv_rows_setting = env::get_var("MLX_QMV_ROWS", 0);
   if (M >= 2 && qmv_rows_setting > 0 && mode == "affine" && biases &&
       !global_scale && K % qmv_fast_k_alignment(bits) == 0) {
-    int max_vecs = qmv_rows_setting == 1 ? 4 : std::min(4, qmv_rows_setting);
+    // The default tile, from whole forwards of Qwen3.8-27B on an M5 Ultra
+    // (2026-11-25): an 8-bit weight has 8 values a thread and a tile of four
+    // rows is fastest; narrower weights have 16 or more and the kernel runs
+    // out of registers past two rows, except that three rows go best as one
+    // tile.
+    int max_vecs = qmv_rows_setting > 1
+        ? std::min(4, qmv_rows_setting)
+        : (bits == 8 ? 4 : (M == 3 ? 3 : 2));
     qmv_fast_rows(
         x, w, scales, *biases, out, group_size, bits, M, N, K, max_vecs, d, s);
     return;
