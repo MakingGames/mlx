@@ -558,6 +558,7 @@ void qmv_fast_rows(
     int M,
     int N,
     int K,
+    int max_vecs,
     metal::Device& d,
     const Stream& s) {
   int B = out.size() / M / N;
@@ -566,10 +567,10 @@ void qmv_fast_rows(
   constexpr int bn = 8;
   constexpr int bk = 32;
 
-  // The fewest tiles, then the smallest tile that fills them; a tile holds at
-  // most four rows.
-  int n_tiles = (M + 3) / 4;
-  int vecs = (M + n_tiles - 1) / n_tiles;
+  // The fewest tiles of at most max_vecs rows, then the smallest tile that
+  // fills them.
+  int n_tiles = (M + max_vecs - 1) / max_vecs;
+  int vecs = std::max(2, (M + n_tiles - 1) / n_tiles);
   bool partial_rows = (N % bn != 0);
 
   MTL::Size group_dims(bk, 2, 1);
@@ -1953,12 +1954,14 @@ void dispatch_qmv(
   // instead: the same arithmetic and the same bits for every row, the weights
   // loaded by one threadgroup for up to four rows. Only where qmv would have
   // chosen qmv_fast (K a multiple of its block), affine, no global scale. Off
-  // by default; a Coder delta (ticket 336).
-  static const bool qmv_rows_enabled = env::get_var("MLX_QMV_ROWS", 0) != 0;
-  if (M >= 2 && qmv_rows_enabled && mode == "affine" && biases &&
+  // by default; a Coder delta (ticket 336). Its value is the most rows a
+  // threadgroup takes, 2 to 4; 1 means the default.
+  static const int qmv_rows_setting = env::get_var("MLX_QMV_ROWS", 0);
+  if (M >= 2 && qmv_rows_setting > 0 && mode == "affine" && biases &&
       !global_scale && K % qmv_fast_k_alignment(bits) == 0) {
+    int max_vecs = qmv_rows_setting == 1 ? 4 : std::min(4, qmv_rows_setting);
     qmv_fast_rows(
-        x, w, scales, *biases, out, group_size, bits, M, N, K, d, s);
+        x, w, scales, *biases, out, group_size, bits, M, N, K, max_vecs, d, s);
     return;
   }
   qmv(x,
