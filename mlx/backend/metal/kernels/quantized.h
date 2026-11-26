@@ -961,13 +961,72 @@ METAL_FUNC void qmv_fast_impl(
   }
 }
 
+// qdot for `vecs` rows of x against one row of weights (Coder delta, ticket
+// 336). For 4- and 8-bit weights each weight is masked and turned to a float
+// once and used for every row; the sums are qdot's, term for term and in
+// qdot's order, so each row gets qdot's bits. Other bit widths call qdot a row.
+// x_thread holds the rows one after another, values_per_thread apart; result
+// is added to at result[v * result_stride].
+template <typename U, int values_per_thread, int bits, int vecs>
+inline void qdot_rows(
+    const device uint8_t* w,
+    const thread U* x_thread,
+    U scale,
+    U bias,
+    const thread U* sums,
+    thread U* result,
+    int result_stride) {
+  if (bits == 4) {
+    U accum[vecs];
+    for (int v = 0; v < vecs; v++) {
+      accum[v] = 0;
+    }
+    const device uint16_t* ws = (const device uint16_t*)w;
+    for (int i = 0; i < (values_per_thread / 4); i++) {
+      uint16_t q = ws[i];
+      U w0 = (q & 0x000f);
+      U w1 = (q & 0x00f0);
+      U w2 = (q & 0x0f00);
+      U w3 = (q & 0xf000);
+      for (int v = 0; v < vecs; v++) {
+        const thread U* xv = x_thread + v * values_per_thread;
+        accum[v] +=
+            (xv[4 * i] * w0 + xv[4 * i + 1] * w1 + xv[4 * i + 2] * w2 +
+             xv[4 * i + 3] * w3);
+      }
+    }
+    for (int v = 0; v < vecs; v++) {
+      result[v * result_stride] += scale * accum[v] + sums[v] * bias;
+    }
+  } else if (bits == 8) {
+    U accum[vecs];
+    for (int v = 0; v < vecs; v++) {
+      accum[v] = 0;
+    }
+    for (int i = 0; i < values_per_thread; i++) {
+      U wi = w[i];
+      for (int v = 0; v < vecs; v++) {
+        accum[v] += x_thread[v * values_per_thread + i] * wi;
+      }
+    }
+    for (int v = 0; v < vecs; v++) {
+      result[v * result_stride] += scale * accum[v] + sums[v] * bias;
+    }
+  } else {
+    for (int v = 0; v < vecs; v++) {
+      result[v * result_stride] += qdot<U, values_per_thread, bits>(
+          w, x_thread + v * values_per_thread, scale, bias, sums[v]);
+    }
+  }
+}
+
 // qmv_fast for several rows of x in one threadgroup (Coder delta, ticket 336).
-// Every row's arithmetic is qmv_fast's, unchanged: the same lanes, the same
-// blocks, the same load_vector and qdot, the same simd_sum. So row v of an
-// M-row product has the bits qmv_fast gives that row alone, and a k-row
-// speculative verify rounds as k single-row decodes do. What changes is that
-// one threadgroup serves up to `vecs` rows, so a tile of weights is loaded by
-// one threadgroup instead of by one a row.
+// Every row's arithmetic is qmv_fast's: the same lanes, the same blocks, the
+// same load_vector, qdot's sums and the same simd_sum. So row v of an M-row
+// product has the bits qmv_fast gives that row alone, and a k-row speculative
+// verify rounds as k single-row decodes do. What changes is that one
+// threadgroup serves `vecs` rows: a tile of weights is loaded once for them,
+// and a 4- or 8-bit weight is unpacked once for them.
 template <
     typename T,
     int group_size,
@@ -999,16 +1058,16 @@ METAL_FUNC void qmv_fast_rows_impl(
 
   typedef float U;
 
-  thread U x_thread[vecs][values_per_thread];
+  thread U x_thread[vecs * values_per_thread];
   thread U sums[vecs];
-  thread U result[vecs][results_per_simdgroup];
-  for (int v = 0; v < vecs; v++) {
-    for (int row = 0; row < results_per_simdgroup; row++) {
-      result[v][row] = 0;
-    }
+  thread U result[vecs * results_per_simdgroup];
+  for (int i = 0; i < vecs * results_per_simdgroup; i++) {
+    result[i] = 0;
   }
 
-  // The rows of x this threadgroup serves; the last tile may hold fewer.
+  // The rows of x this threadgroup serves. The last tile may hold fewer than
+  // `vecs`: its spare slots compute the tile's last row again and store
+  // nothing, so every loop below has a constant bound.
   const int first_vec = tid.x * vecs;
   const int n_vecs = min(vecs, M - first_vec);
 
@@ -1035,9 +1094,10 @@ METAL_FUNC void qmv_fast_rows_impl(
   const int aligned_end = (in_vec_size / block_size) * block_size;
 
   for (int k = 0; k < aligned_end; k += block_size) {
-    for (int v = 0; v < n_vecs; v++) {
+    for (int v = 0; v < vecs; v++) {
       sums[v] = load_vector<T, U, values_per_thread, bits>(
-          x + v * in_vec_size, x_thread[v]);
+          x + min(v, n_vecs - 1) * in_vec_size,
+          x_thread + v * values_per_thread);
     }
 
     for (int row = 0; row < results_per_simdgroup; row++) {
@@ -1051,10 +1111,8 @@ METAL_FUNC void qmv_fast_rows_impl(
 
       U s = sl[0];
       U b = bl[0];
-      for (int v = 0; v < n_vecs; v++) {
-        result[v][row] +=
-            qdot<U, values_per_thread, bits>(wl, x_thread[v], s, b, sums[v]);
-      }
+      qdot_rows<U, values_per_thread, bits, vecs>(
+          wl, x_thread, s, b, sums, result + row, results_per_simdgroup);
     }
 
     ws += block_size * bytes_per_pack / pack_factor;
@@ -1070,9 +1128,10 @@ METAL_FUNC void qmv_fast_rows_impl(
         (aligned_end + static_cast<int>(simd_lid) * values_per_thread) <
         in_vec_size;
     if (in_bounds) {
-      for (int v = 0; v < n_vecs; v++) {
+      for (int v = 0; v < vecs; v++) {
         sums[v] = load_vector<T, U, values_per_thread, bits>(
-            x + v * in_vec_size, x_thread[v]);
+            x + min(v, n_vecs - 1) * in_vec_size,
+            x_thread + v * values_per_thread);
       }
 
       for (int row = 0; row < results_per_simdgroup; row++) {
@@ -1086,19 +1145,17 @@ METAL_FUNC void qmv_fast_rows_impl(
 
         U s = sl[0];
         U b = bl[0];
-        for (int v = 0; v < n_vecs; v++) {
-          result[v][row] +=
-              qdot<U, values_per_thread, bits>(wl, x_thread[v], s, b, sums[v]);
-        }
+        qdot_rows<U, values_per_thread, bits, vecs>(
+            wl, x_thread, s, b, sums, result + row, results_per_simdgroup);
       }
     }
   }
 
-  for (int v = 0; v < n_vecs; v++) {
+  for (int v = 0; v < vecs; v++) {
     for (int row = 0; row < results_per_simdgroup; row++) {
-      result[v][row] = simd_sum(result[v][row]);
-      if (simd_lid == 0 && row <= last_row) {
-        y[v * out_vec_size + row] = static_cast<T>(result[v][row]);
+      U r = simd_sum(result[v * results_per_simdgroup + row]);
+      if (simd_lid == 0 && row <= last_row && v < n_vecs) {
+        y[v * out_vec_size + row] = static_cast<T>(r);
       }
     }
   }
